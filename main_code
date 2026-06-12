@@ -1,0 +1,1063 @@
+Configuration Module - config.py
+
+```python
+from dataclasses import dataclass
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+MODELS_DIR = PROJECT_ROOT / "models"
+
+@dataclass(frozen=True)
+class VisionConfig:
+    enabled: bool = True
+    camera_backend: str = "realsense"
+    fallback_to_opencv: bool = True
+    camera_index: int = 0
+    model_name: str = "yolo26n.pt"
+    model_path: Path = MODELS_DIR / "yolo26n.pt"
+    yolo_version: str = "YOLO26"
+    device: str = "cpu"
+    confidence_threshold: float = 0.45
+    frame_width: int = 640
+    frame_height: int = 480
+    frame_rate: int = 30
+    imgsz: int = 320
+    detection_classes: tuple[str, ...] = (
+        "cup",
+        "bottle",
+        "can",
+        "coffee_cup",
+        "water_bottle",
+        "soda_can",
+    )
+
+@dataclass(frozen=True)
+class PlatformConfig:
+    host: str = "10.42.0.1"
+    port: int = 9090
+    websocket_path: str = "/"
+    connect_timeout_seconds: float = 5.0
+    response_timeout_seconds: float = 10.0
+    navigation_timeout_seconds: float = 120.0
+    table_1_poi: str = "table_1"
+    table_2_poi: str = "table_2"
+    poi_service: str = "/poi"
+    navi_status_topic: str = "/navi_status"
+    navi_status_type: str = "actionlib_msgs/GoalStatus"
+    robot_status_topic: str = "/robot_status"
+    robot_status_type: str = "yutong_assistance/RobotStatus"
+    soft_stop_topic: str = "/soft_stop"
+    soft_stop_type: str = "std_msgs/Bool"
+    cancel_goal_topic: str = "/move_base/cancel"
+    cancel_goal_type: str = "actionlib_msgs/GoalID"
+    arrived_status: int = 3
+    running_status: int = 1
+    canceled_status: int = 2
+    failed_status: int = 4
+    stop_on_shutdown: bool = True
+    allow_dry_run_without_platform: bool = True
+
+@dataclass(frozen=True)
+class MissionConfig:
+    pickup_object_classes: tuple[str, ...] = (
+        "cup",
+        "bottle",
+        "can",
+        "coffee_cup",
+        "water_bottle",
+        "soda_can",
+    )
+    loop_delay_seconds: float = 0.05
+    object_detection_attempts: int = 40
+    red_zone_detection_attempts: int = 40
+    placement_verification_attempts: int = 15
+
+@dataclass(frozen=True)
+class ROSManipulationConfig:
+    camera_frame_id: str = "camera_link"
+    right_arm_target_topic: str = "/right_arm/target_pose"
+    left_arm_target_topic: str = "/left_arm/target_pose"
+    use_right_arm_only: bool = True
+
+VISION = VisionConfig()
+PLATFORM = PlatformConfig()
+MISSION = MissionConfig()
+ROS_MANIPULATION = ROSManipulationConfig()
+```
+
+B.2 Computer Vision Module - vision.py
+
+```python
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from config import VisionConfig
+from utils import Detection
+
+@dataclass(frozen=True)
+class VisionFrame:
+    color: Any
+    depth_frame: Any = None
+    depth_intrinsics: Any = None
+
+class VisionSystem:
+    """
+    Camera and YOLO object detection module.
+    The primary setup uses Intel RealSense RGB-D input and YOLO inference.
+    """
+
+    def __init__(self, config: VisionConfig) -> None:
+        self.config = config
+        self._camera: Any = None
+        self._model: Any = None
+        self._cv2: Any = None
+        self._rs: Any = None
+        self._pipeline: Any = None
+        self._align: Any = None
+        self._using_realsense = False
+        self._latest_detections: list[Detection] = []
+
+    def initialize(self) -> None:
+        import cv2
+        self._cv2 = cv2
+        self._load_yolo_model()
+
+        if self.config.camera_backend == "realsense":
+            try:
+                self._initialize_realsense()
+                print("VisionSystem initialized with Intel RealSense RGB + depth")
+                return
+            except Exception as exc:
+                print(f"Could not initialize Intel RealSense: {exc}")
+                if not self.config.fallback_to_opencv:
+                    raise
+
+        self._initialize_opencv_camera()
+        print("VisionSystem initialized with OpenCV camera fallback")
+
+    def _load_yolo_model(self) -> None:
+        from ultralytics import YOLO
+        model_path = self._resolve_model_path()
+        self._model = YOLO(str(model_path))
+        print(f"{self.config.yolo_version} model loaded from {model_path}")
+
+    def _resolve_model_path(self) -> Path:
+        candidates = [self.config.model_path, self.config.raspberry_pi_model_path]
+        for path in candidates:
+            if path.exists():
+                return path
+        return Path(self.config.model_name)
+
+    def _initialize_realsense(self) -> None:
+        import pyrealsense2 as rs
+
+        self._rs = rs
+        pipeline = rs.pipeline()
+        stream_config = rs.config()
+        stream_config.enable_stream(
+            rs.stream.color,
+            self.config.frame_width,
+            self.config.frame_height,
+            rs.format.bgr8,
+            self.config.frame_rate,
+        )
+        stream_config.enable_stream(
+            rs.stream.depth,
+            self.config.frame_width,
+            self.config.frame_height,
+            rs.format.z16,
+            self.config.frame_rate,
+        )
+
+        pipeline.start(stream_config)
+        self._pipeline = pipeline
+        self._align = rs.align(rs.stream.color)
+        self._using_realsense = True
+
+    def _initialize_opencv_camera(self) -> None:
+        self._camera = self._cv2.VideoCapture(self.config.camera_index)
+        self._camera.set(self._cv2.CAP_PROP_FRAME_WIDTH, self.config.frame_width)
+        self._camera.set(self._cv2.CAP_PROP_FRAME_HEIGHT, self.config.frame_height)
+
+        if not self._camera.isOpened():
+            raise RuntimeError("Could not open camera")
+
+    def get_frame(self) -> VisionFrame | None:
+        if self._using_realsense:
+            return self._get_realsense_frame()
+
+        if self._camera is None:
+            return None
+
+        success, frame = self._camera.read()
+        if not success:
+            return None
+        return VisionFrame(color=frame)
+
+    def _get_realsense_frame(self) -> VisionFrame | None:
+        frames = self._pipeline.wait_for_frames()
+        aligned_frames = self._align.process(frames)
+        color_frame = aligned_frames.get_color_frame()
+        depth_frame = aligned_frames.get_depth_frame()
+
+        if not color_frame or not depth_frame:
+            return None
+
+        import numpy as np
+        color = np.asanyarray(color_frame.get_data())
+        depth_intrinsics = depth_frame.profile.as_video_stream_profile().intrinsics
+
+        return VisionFrame(
+            color=color,
+            depth_frame=depth_frame,
+            depth_intrinsics=depth_intrinsics,
+        )
+```
+
+B.3 YOLO Detection and Depth Estimation - vision.py
+
+```python
+class VisionSystem:
+    def detect(self, frame: VisionFrame | Any) -> list[Detection]:
+        if frame is None or self._model is None:
+            return []
+
+        if not isinstance(frame, VisionFrame):
+            frame = VisionFrame(color=frame)
+
+        self._latest_detections = self._run_yolo(frame)
+        return self._latest_detections
+
+    def _run_yolo(self, frame: VisionFrame) -> list[Detection]:
+        results = self._model.predict(
+            frame.color,
+            conf=self.config.confidence_threshold,
+            imgsz=self.config.imgsz,
+            device=self.config.device,
+            iou=self.config.yolo_iou_threshold,
+            max_det=self.config.yolo_max_detections,
+            verbose=False,
+        )
+
+        detections: list[Detection] = []
+        allowed_classes = set(self.config.detection_classes)
+
+        for result in results:
+            names = result.names
+            for box in result.boxes:
+                confidence = float(box.conf[0])
+                class_id = int(box.cls[0])
+                label = names.get(class_id, str(class_id))
+
+                if label not in allowed_classes:
+                    continue
+
+                x1, y1, x2, y2 = [int(value) for value in box.xyxy[0]]
+                center_pixel = ((x1 + x2) // 2, (y1 + y2) // 2)
+
+                distance_m, position_3d_m = self._estimate_depth(
+                    frame,
+                    center_pixel,
+                )
+
+                detections.append(
+                    Detection(
+                        label=label,
+                        confidence=confidence,
+                        bbox=(x1, y1, x2, y2),
+                        center_pixel=center_pixel,
+                        distance_m=distance_m,
+                        position_3d_m=position_3d_m,
+                    )
+                )
+
+        return detections
+
+    def _estimate_depth(
+        self,
+        frame: VisionFrame,
+        center_pixel: tuple[int, int],
+    ) -> tuple[float | None, tuple[float, float, float] | None]:
+        if frame.depth_frame is None or frame.depth_intrinsics is None:
+            return None, None
+
+        cx, cy = center_pixel
+        distance_m = float(frame.depth_frame.get_distance(cx, cy))
+
+        if distance_m <= 0:
+            return None, None
+
+        point = self._rs.rs2_deproject_pixel_to_point(
+            frame.depth_intrinsics,
+            [cx, cy],
+            distance_m,
+        )
+
+        position_3d_m = (
+            round(point[0], 3),
+            round(point[1], 3),
+            round(point[2], 3),
+        )
+
+        return round(distance_m, 3), position_3d_m
+```
+
+B.4 Object Selection Module - object_selection.py
+
+```python
+from dataclasses import dataclass
+from typing import Iterable
+
+from utils import Detection
+
+@dataclass(frozen=True)
+class SelectedObject:
+    label: str
+    confidence: float
+    bbox: tuple[int, int, int, int]
+    center_pixel: tuple[int, int]
+    distance_m: float | None
+    position_3d_m: tuple[float, float, float] | None
+    reason: str
+
+    @property
+    def xyz_text(self) -> str:
+        if self.position_3d_m is None:
+            return "xyz=unknown"
+        x_m, y_m, z_m = self.position_3d_m
+        return f"xyz=({x_m:.3f}, {y_m:.3f}, {z_m:.3f})m"
+
+class ObjectSelector:
+    """Choose the closest valid pickup object."""
+
+    def __init__(
+        self,
+        frame_width: int = 640,
+        allowed_objects: tuple[str, ...] | None = None,
+    ) -> None:
+        self.frame_width = frame_width
+        self.allowed_objects = allowed_objects or (
+            "cup",
+            "bottle",
+            "can",
+            "coffee_cup",
+            "water_bottle",
+            "soda_can",
+        )
+
+    def select(
+        self,
+        detections_or_snapshot: Iterable[Detection] | object,
+    ) -> SelectedObject | None:
+        detections = self._extract_detections(detections_or_snapshot)
+
+        matches = [
+            detection
+            for detection in detections
+            if detection.label in self.allowed_objects
+        ]
+
+        if not matches:
+            return None
+
+        best = min(matches, key=self._distance_key)
+
+        return SelectedObject(
+            label=best.label,
+            confidence=best.confidence,
+            bbox=best.bbox,
+            center_pixel=best.center,
+            distance_m=best.distance_m,
+            position_3d_m=best.position_3d_m,
+            reason=f"Selected closest visible object: {best.label}.",
+        )
+
+    def _extract_detections(
+        self,
+        detections_or_snapshot: Iterable[Detection] | object,
+    ) -> list[Detection]:
+        snapshot_detections = getattr(detections_or_snapshot, "detections", None)
+        if snapshot_detections is not None:
+            return list(snapshot_detections)
+        return list(detections_or_snapshot)
+
+    def _distance_key(self, detection: Detection) -> tuple[int, float]:
+        if detection.distance_m is not None:
+            return (0, detection.distance_m)
+
+        area = max(1, detection.width * detection.height)
+        return (1, 1.0 / area)
+```
+
+B.5 Red Zone Detection Module - red_zone_detector.py
+
+```python
+from dataclasses import dataclass
+from typing import Any
+
+@dataclass(frozen=True)
+class RedZone:
+    center_pixel: tuple[int, int]
+    bbox: tuple[int, int, int, int]
+    area: float
+    shape: str
+    confidence: float
+
+class RedZoneDetector:
+    """
+    Detects a red placement region using OpenCV HSV color segmentation.
+    """
+
+    def __init__(self, min_area: float = 800.0) -> None:
+        self.min_area = min_area
+
+    def detect(self, frame: Any) -> RedZone | None:
+        if frame is None:
+            return None
+
+        import cv2
+        import numpy as np
+
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        lower_red_1 = np.array([0, 80, 70])
+        upper_red_1 = np.array([10, 255, 255])
+        lower_red_2 = np.array([170, 80, 70])
+        upper_red_2 = np.array([180, 255, 255])
+
+        mask_1 = cv2.inRange(hsv, lower_red_1, upper_red_1)
+        mask_2 = cv2.inRange(hsv, lower_red_2, upper_red_2)
+        mask = cv2.bitwise_or(mask_1, mask_2)
+
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        if not contours:
+            return None
+
+        contour = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(contour))
+
+        if area < self.min_area:
+            return None
+
+        x, y, w, h = cv2.boundingRect(contour)
+        moments = cv2.moments(contour)
+
+        if moments["m00"] == 0:
+            center = (x + w // 2, y + h // 2)
+        else:
+            center = (
+                int(moments["m10"] / moments["m00"]),
+                int(moments["m01"] / moments["m00"]),
+            )
+
+        perimeter = max(cv2.arcLength(contour, True), 1.0)
+        circularity = 4.0 * 3.141592653589793 * area / (perimeter * perimeter)
+        shape = "circle" if circularity >= 0.70 else "square"
+
+        return RedZone(
+            center_pixel=center,
+            bbox=(x, y, x + w, y + h),
+            area=area,
+            shape=shape,
+            confidence=max(0.0, min(1.0, circularity)),
+        )
+```
+
+B.6 Platform Communication Module - platform_controller.py
+
+```python
+from dataclasses import dataclass
+from time import monotonic, sleep
+
+from config import PlatformConfig
+from platform_protocol import PlatformProtocol
+
+@dataclass(frozen=True)
+class NavigationResult:
+    reached: bool
+    status: int | None
+    text: str
+    target_name: str
+
+class PlatformController:
+    """
+    High-level controller for the Wi-Fi WebSocket mobile platform.
+    """
+
+    def __init__(self, config: PlatformConfig) -> None:
+        self.config = config
+        self.protocol = PlatformProtocol(config)
+        self._last_navigation_status: int | None = None
+        self._last_navigation_text = ""
+
+    def initialize(self) -> None:
+        self.protocol.connect()
+
+        self.protocol.subscribe(
+            topic=self.config.navi_status_topic,
+            message_type=self.config.navi_status_type,
+            message_id="get_navi_status",
+        )
+
+        self.protocol.subscribe(
+            topic=self.config.robot_status_topic,
+            message_type=self.config.robot_status_type,
+            message_id="get_robot_status",
+            throttle_rate=500,
+        )
+
+        print("PlatformController initialized for WebSocket POI navigation")
+
+    def go_to_table_1(self) -> NavigationResult:
+        return self.go_to_poi(self.config.table_1_poi)
+
+    def go_to_table_2(self) -> NavigationResult:
+        return self.go_to_poi(self.config.table_2_poi)
+
+    def go_to_poi(self, poi_name: str) -> NavigationResult:
+        response = self.protocol.call_service(
+            service=self.config.poi_service,
+            args={"poi": poi_name},
+            message_id=f"service_poi_{poi_name}",
+            timeout_seconds=self.config.response_timeout_seconds,
+        )
+
+        if response is None:
+            return NavigationResult(
+                reached=False,
+                status=None,
+                text="POI request sent; no immediate service response received.",
+                target_name=poi_name,
+            )
+
+        return NavigationResult(
+            reached=False,
+            status=None,
+            text="POI request accepted.",
+            target_name=poi_name,
+        )
+
+    def wait_until_arrived(self, poi_name: str) -> NavigationResult:
+        if self.protocol.is_dry_run:
+            return NavigationResult(
+                reached=True,
+                status=self.config.arrived_status,
+                text="dry-run arrival",
+                target_name=poi_name,
+            )
+
+        deadline = monotonic() + self.config.navigation_timeout_seconds
+
+        while monotonic() < deadline:
+            message = self.protocol.receive_until(
+                lambda msg: msg.topic == self.config.navi_status_topic,
+                timeout_seconds=1.0,
+            )
+
+            if message is None:
+                continue
+
+            status, text = self._parse_navigation_status(message)
+            self._last_navigation_status = status
+            self._last_navigation_text = text
+
+            if status == self.config.arrived_status:
+                return NavigationResult(True, status, text, poi_name)
+
+            if status in {self.config.canceled_status, self.config.failed_status}:
+                return NavigationResult(False, status, text, poi_name)
+
+            sleep(0.05)
+
+        return NavigationResult(
+            reached=False,
+            status=self._last_navigation_status,
+            text=f"Timed out waiting for {poi_name}: {self._last_navigation_text}",
+            target_name=poi_name,
+        )
+
+    def cancel_navigation(self) -> None:
+        self.protocol.advertise(
+            topic=self.config.cancel_goal_topic,
+            message_type=self.config.cancel_goal_type,
+            message_id="cancel_goal",
+        )
+
+        self.protocol.publish(
+            topic=self.config.cancel_goal_topic,
+            message_id="cancel_goal",
+            msg={"stamp": "", "id": ""},
+        )
+
+    def emergency_stop(self, enabled: bool = True) -> None:
+        self.protocol.advertise(
+            topic=self.config.soft_stop_topic,
+            message_type=self.config.soft_stop_type,
+            message_id="set_estop",
+        )
+
+        self.protocol.publish(
+            topic=self.config.soft_stop_topic,
+            message_id="set_estop",
+            msg={"data": enabled},
+        )
+
+    def shutdown(self) -> None:
+        if self.config.stop_on_shutdown:
+            self.cancel_navigation()
+        self.protocol.close()
+        print("PlatformController shutdown complete")
+```
+
+B.7 ROS Manipulation Interface - ros_manipulation_controller.py
+
+```python
+from typing import Any
+
+import config
+from object_selection import SelectedObject
+from red_zone_detector import RedZone
+
+class ROSManipulationController:
+    """
+    ROS 2 adapter used to publish camera-based target poses to the arm interface.
+    """
+
+    def __init__(self) -> None:
+        self._rclpy: Any = None
+        self._node: Any = None
+        self._pose_stamped_cls: Any = None
+        self._right_arm_target_pub: Any = None
+        self._left_arm_target_pub: Any = None
+        self._dry_run = False
+
+    def initialize(self) -> None:
+        try:
+            import rclpy
+            from geometry_msgs.msg import PoseStamped
+        except ImportError:
+            self._dry_run = True
+            print("ROSManipulationController dry-run mode")
+            return
+
+        self._rclpy = rclpy
+        self._pose_stamped_cls = PoseStamped
+
+        if not rclpy.ok():
+            rclpy.init(args=None)
+
+        self._node = rclpy.create_node("robot_mission_manipulation_bridge")
+
+        self._right_arm_target_pub = self._node.create_publisher(
+            PoseStamped,
+            config.ROS_MANIPULATION.right_arm_target_topic,
+            10,
+        )
+
+        self._left_arm_target_pub = self._node.create_publisher(
+            PoseStamped,
+            config.ROS_MANIPULATION.left_arm_target_topic,
+            10,
+        )
+
+    def pick_object(self, selected_object: SelectedObject) -> bool:
+        if selected_object.position_3d_m is None:
+            print("Cannot publish pick target: selected object has no RealSense XYZ.")
+            return False
+
+        return self._publish_camera_xyz_target(
+            xyz=selected_object.position_3d_m,
+            label=selected_object.label,
+            use_right_arm=True,
+        )
+
+    def _publish_camera_xyz_target(
+        self,
+        xyz: tuple[float, float, float],
+        label: str,
+        use_right_arm: bool,
+    ) -> bool:
+        if self._dry_run or self._node is None or self._pose_stamped_cls is None:
+            print(f"ROS dry-run: would publish {label} XYZ target {xyz}")
+            return True
+
+        msg = self._pose_stamped_cls()
+        msg.header.frame_id = config.ROS_MANIPULATION.camera_frame_id
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+
+        msg.pose.position.x = float(xyz[0])
+        msg.pose.position.y = float(xyz[1])
+        msg.pose.position.z = float(xyz[2])
+        msg.pose.orientation.w = 1.0
+
+        publisher = self._right_arm_target_pub
+        publisher.publish(msg)
+
+        return True
+
+    def place_object(self, red_zone: RedZone) -> bool:
+        print(f"Right arm ROS command: place object at {red_zone.center_pixel}")
+        return True
+
+    def shutdown(self) -> None:
+        if self._node is not None:
+            self._node.destroy_node()
+            self._node = None
+
+        if self._rclpy is not None and self._rclpy.ok():
+            self._rclpy.shutdown()
+
+        print("ROSManipulationController shutdown complete")
+```
+
+B.8 Mission State Machine Module - table_mission_executor.py
+
+```python
+from dataclasses import dataclass
+from enum import StrEnum
+from time import sleep
+
+import config
+
+class TableMissionState(StrEnum):
+    IDLE = "IDLE"
+    GO_TO_TABLE_1 = "GO_TO_TABLE_1"
+    WAIT_FOR_TABLE_1 = "WAIT_FOR_TABLE_1"
+    DETECT_OBJECT = "DETECT_OBJECT"
+    PICK_OBJECT = "PICK_OBJECT"
+    GO_TO_TABLE_2 = "GO_TO_TABLE_2"
+    WAIT_FOR_TABLE_2 = "WAIT_FOR_TABLE_2"
+    DETECT_RED_ZONE = "DETECT_RED_ZONE"
+    PLACE_OBJECT = "PLACE_OBJECT"
+    VERIFY_PLACEMENT = "VERIFY_PLACEMENT"
+    DONE = "DONE"
+    ERROR = "ERROR"
+    EMERGENCY_STOP = "EMERGENCY_STOP"
+
+@dataclass(frozen=True)
+class TableMissionResult:
+    success: bool
+    state: TableMissionState
+    message: str
+    selected_object: object | None = None
+    red_zone: object | None = None
+
+class TableMissionExecutor:
+    """
+    Coordinates platform navigation, YOLO perception, and ROS manipulation.
+    """
+
+    def __init__(
+        self,
+        platform,
+        vision,
+        manipulator,
+        red_zone_detector,
+        object_selector,
+    ) -> None:
+        self.platform = platform
+        self.vision = vision
+        self.manipulator = manipulator
+        self.red_zone_detector = red_zone_detector
+        self.object_selector = object_selector
+        self.state = TableMissionState.IDLE
+        self.selected_object = None
+        self.red_zone = None
+
+    def run(self) -> TableMissionResult:
+        try:
+            self._set_state(TableMissionState.GO_TO_TABLE_1)
+            self.platform.go_to_table_1()
+
+            self._set_state(TableMissionState.WAIT_FOR_TABLE_1)
+            table_1_result = self.platform.wait_until_arrived(
+                config.PLATFORM.table_1_poi
+            )
+
+            if not table_1_result.reached:
+                return self._fail(f"Could not reach table_1: {table_1_result.text}")
+
+            self._set_state(TableMissionState.DETECT_OBJECT)
+            self.selected_object = self._detect_closest_object()
+
+            if self.selected_object is None:
+                return self._fail("No valid pickup object detected on table_1.")
+
+            self._set_state(TableMissionState.PICK_OBJECT)
+            self.manipulator.look_at_target(self.selected_object)
+
+            if not self.manipulator.pick_object(self.selected_object):
+                return self._fail("ROS arm failed to pick the selected object.")
+
+            self._set_state(TableMissionState.GO_TO_TABLE_2)
+            self.platform.go_to_table_2()
+
+            self._set_state(TableMissionState.WAIT_FOR_TABLE_2)
+            table_2_result = self.platform.wait_until_arrived(
+                config.PLATFORM.table_2_poi
+            )
+
+            if not table_2_result.reached:
+                return self._fail(f"Could not reach table_2: {table_2_result.text}")
+
+            self._set_state(TableMissionState.DETECT_RED_ZONE)
+            self.red_zone = self._detect_red_zone()
+
+            if self.red_zone is None:
+                return self._fail("No red placement area detected on table_2.")
+
+            self._set_state(TableMissionState.PLACE_OBJECT)
+            self.manipulator.place_object(self.red_zone)
+
+            self._set_state(TableMissionState.VERIFY_PLACEMENT)
+            if not self._verify_placement():
+                return self._fail("Placement verification failed.")
+
+            self._set_state(TableMissionState.DONE)
+
+            return TableMissionResult(
+                success=True,
+                state=self.state,
+                message="Mission completed successfully.",
+                selected_object=self.selected_object,
+                red_zone=self.red_zone,
+            )
+
+        except KeyboardInterrupt:
+            self._set_state(TableMissionState.EMERGENCY_STOP)
+            self.platform.emergency_stop(True)
+            return self._fail("Mission interrupted; emergency stop enabled.")
+
+        except Exception as exc:
+            return self._fail(f"Mission error: {exc}")
+
+    def _detect_closest_object(self, attempts: int | None = None):
+        attempts = attempts or config.MISSION.object_detection_attempts
+
+        for _ in range(attempts):
+            frame = self.vision.get_frame()
+            detections = self.vision.detect(frame)
+            selected = self.object_selector.select(detections)
+
+            if selected is not None:
+                return selected
+
+            sleep(config.MISSION.loop_delay_seconds)
+
+        return None
+
+    def _set_state(self, state: TableMissionState) -> None:
+        self.state = state
+        print(f"MISSION STATE -> {state.value}")
+
+    def _fail(self, message: str) -> TableMissionResult:
+        self._set_state(TableMissionState.ERROR)
+        print(f"MISSION FAILED: {message}")
+
+        return TableMissionResult(
+            success=False,
+            state=self.state,
+            message=message,
+            selected_object=self.selected_object,
+            red_zone=self.red_zone,
+        )
+```
+
+B.9 Main Mission Entry Point - main_mission.py
+
+```python
+import config
+
+from object_selection import ObjectSelector
+from platform_controller import PlatformController
+from red_zone_detector import RedZoneDetector
+from ros_manipulation_controller import ROSManipulationController
+from table_mission_executor import TableMissionExecutor
+from vision import VisionSystem
+
+def main() -> None:
+    platform = PlatformController(config.PLATFORM)
+    vision = VisionSystem(config.VISION)
+    manipulator = ROSManipulationController()
+    red_zone_detector = RedZoneDetector()
+
+    object_selector = ObjectSelector(
+        frame_width=config.VISION.frame_width,
+        allowed_objects=config.MISSION.pickup_object_classes,
+    )
+
+    try:
+        platform.initialize()
+        vision.initialize()
+        manipulator.initialize()
+
+        mission = TableMissionExecutor(
+            platform=platform,
+            vision=vision,
+            manipulator=manipulator,
+            red_zone_detector=red_zone_detector,
+            object_selector=object_selector,
+        )
+
+        result = mission.run()
+        print(f"Mission result: success={result.success} | {result.message}")
+
+    except KeyboardInterrupt:
+        print("Ctrl+C received. Enabling platform emergency stop.")
+        platform.emergency_stop(True)
+
+    finally:
+        platform.shutdown()
+        manipulator.shutdown()
+        vision.shutdown()
+        print("main_mission shutdown complete")
+
+if __name__ == "__main__":
+    main()
+```
+
+B.10 MoveIt Target Subscriber Module - camera_move.py
+
+```python
+import os
+import numpy as np
+import rclpy
+
+from geometry_msgs.msg import Point, PoseStamped
+from moveit.planning import MoveItPy
+from rclpy.node import Node
+from visualization_msgs.msg import Marker
+
+LEFT_GROUP = "left_arm"
+RIGHT_GROUP = "Right_arm"
+LEFT_TIP_LINK = "L_Wrist_Yaw_Link"
+RIGHT_TIP_LINK = "R_Wrist_Yaw_Link"
+
+PLANNING_FRAME = "base_link"
+CAMERA_FRAME = "camera_link"
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+DRY_RUN = env_bool("ROBOT_MOVEIT_DRY_RUN", True)
+
+CAMERA_POSITION_IN_BASE = (0.00, 0.00, 0.45)
+
+R_CAMERA_OPTICAL_TO_BASE = np.array(
+    [
+        [0.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+    ],
+    dtype=float,
+)
+
+def transform_camera_point_to_base(
+    camera_point_xyz: tuple[float, float, float],
+    camera_position_in_base_xyz: tuple[float, float, float] = CAMERA_POSITION_IN_BASE,
+) -> np.ndarray:
+    point_camera = np.array(camera_point_xyz, dtype=float)
+    camera_origin_base = np.array(camera_position_in_base_xyz, dtype=float)
+    return R_CAMERA_OPTICAL_TO_BASE @ point_camera + camera_origin_base
+
+class RobotControllerSubscriber(Node):
+    def __init__(self, moveit_robot):
+        super().__init__("robot_controller_subscriber")
+
+        self.robot = moveit_robot
+        self.left_arm_component = self.robot.get_planning_component(LEFT_GROUP)
+        self.right_arm_component = self.robot.get_planning_component(RIGHT_GROUP)
+
+        self.sub_left = self.create_subscription(
+            PoseStamped,
+            "/left_arm/target_pose",
+            self.left_callback,
+            10,
+        )
+
+        self.sub_right = self.create_subscription(
+            PoseStamped,
+            "/right_arm/target_pose",
+            self.right_callback,
+            10,
+        )
+
+        self.get_logger().info("Robot Controller Ready!")
+        self.get_logger().info(f"Incoming target pose frame: {CAMERA_FRAME}")
+        self.get_logger().info(f"MoveIt planning frame: {PLANNING_FRAME}")
+        self.get_logger().info(f"DRY_RUN mode: {DRY_RUN}")
+
+    def plan_and_execute(self, arm_component, group_name, tip_link, target_pose_msg):
+        self.get_logger().info(f"Planning motion for {group_name}")
+
+        arm_component.set_start_state_to_current_state()
+        arm_component.set_goal_state(
+            pose_stamped_msg=target_pose_msg,
+            pose_link=tip_link,
+        )
+
+        plan_result = arm_component.plan()
+
+        if plan_result:
+            if DRY_RUN:
+                self.get_logger().info(
+                    f"DRY_RUN: path found for {group_name}; execution skipped."
+                )
+            else:
+                self.robot.execute(plan_result.trajectory, controllers=[])
+                self.get_logger().info(f"Execution for {group_name} finished.")
+        else:
+            self.get_logger().error(f"Planning failed for {group_name}.")
+
+    def left_callback(self, msg):
+        self.get_logger().info(
+            f"Received LEFT arm target from camera. Z={msg.pose.position.z:.3f}"
+        )
+        self.plan_and_execute(
+            self.left_arm_component,
+            LEFT_GROUP,
+            LEFT_TIP_LINK,
+            msg,
+        )
+
+    def right_callback(self, msg):
+        self.get_logger().info(
+            f"Received RIGHT arm target from camera. Z={msg.pose.position.z:.3f}"
+        )
+        self.plan_and_execute(
+            self.right_arm_component,
+            RIGHT_GROUP,
+            RIGHT_TIP_LINK,
+            msg,
+        )
+
+def main(args=None):
+    rclpy.init(args=args)
+    print("Initializing MoveIt setup...")
+
+    robot = MoveItPy(node_name="moveit_py_node")
+    controller_node = RobotControllerSubscriber(robot)
+
+    try:
+        rclpy.spin(controller_node)
+    except KeyboardInterrupt:
+        pass
+
+    controller_node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()
+```
