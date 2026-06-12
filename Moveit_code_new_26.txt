@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped
+from moveit.planning import MoveItPy
+from  robot_driver import Abeed
+
+# ---------------------------------------------------------
+# CONFIGURATION CONSTANTS
+# ---------------------------------------------------------
+LEFT_GROUP = "left_arm"
+RIGHT_GROUP = "Right_arm"
+LEFT_TIP_LINK = "L_Wrist_Yaw_Link"
+RIGHT_TIP_LINK = "R_Wrist_Yaw_Link"
+
+
+class RobotControllerSubscriber(Node):
+    def __init__(self, moveit_robot):
+        super().__init__('robot_controller_subscriber')
+        self.robot = moveit_robot
+
+        # Load planning components for both arms
+        self.left_arm_component = self.robot.get_planning_component(LEFT_GROUP)
+        self.right_arm_component = self.robot.get_planning_component(RIGHT_GROUP)
+
+        # Create subscribers for both arms
+        self.sub_left = self.create_subscription(
+            PoseStamped, '/left_arm/target_pose', self.left_callback, 10)
+        self.sub_right = self.create_subscription(
+            PoseStamped, '/right_arm/target_pose', self.right_callback, 10)
+
+        self.get_logger().info("=======================================")
+        self.get_logger().info("Robot Controller Ready!")
+        self.get_logger().info("Waiting for camera targets...")
+        self.get_logger().info("=======================================")
+
+        self.physical_robot = Abeed()
+
+    def plan_and_execute(self, arm_component, group_name, tip_link, target_pose_msg):
+        """Standardized function to plan and execute motion for either arm"""
+        self.get_logger().info(f"--- Planning motion for {group_name} ---")
+
+        # 1. Set start state to current
+        if group_name == "left_arm":
+            ph_group_name = "left_arm"
+        else:
+            ph_group_name = "right_arm"
+        current_joints_pos = self.physical_robot.get_pos(ph_group_name)
+        arm_component.set_start_state_to_current_state()
+
+        # 2. Set goal directly from the PoseStamped message we received!
+        arm_component.set_goal_state(pose_stamped_msg=target_pose_msg, pose_link=tip_link)
+
+        # 3. Plan
+        plan_result = arm_component.plan()
+
+        # 4. Execute if path is found
+        if plan_result:
+            self.get_logger().info(f"Path found for {group_name}! Executing trajectory...")
+            self.robot.execute(plan_result.trajectory, controllers=[])
+            self.get_logger().info(f"Execution for {group_name} finished.\n")
+        else:
+            self.get_logger().error(f"Planning failed for {group_name}.\n")
+
+    def left_callback(self, msg):
+        self.get_logger().info(f"Received LEFT arm target from camera. Z-height: {msg.pose.position.z:.3f}")
+        self.plan_and_execute(self.left_arm_component, LEFT_GROUP, LEFT_TIP_LINK, msg)
+
+    def right_callback(self, msg):
+        self.get_logger().info(f"Received RIGHT arm target from camera. Z-height: {msg.pose.position.z:.3f}")
+        self.plan_and_execute(self.right_arm_component, RIGHT_GROUP, RIGHT_TIP_LINK, msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+
+    # 1. Initialize MoveIt FIRST
+    print("Initializing MoveIt setup... (This takes a few seconds)")
+    robot = MoveItPy(node_name="moveit_py_node")
+
+    # 2. Initialize our custom node and pass MoveIt into it
+    controller_node = RobotControllerSubscriber(robot)
+
+
+    # 3. Spin the node so it stays alive and listens for messages
+    try:
+        rclpy.spin(controller_node)
+    except KeyboardInterrupt:
+        pass
+
+    controller_node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

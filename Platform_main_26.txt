@@ -1,0 +1,225 @@
+"""
+Coordinate-based navigation goals for the Moonknight robot.
+
+Works alongside the simple robot_client.py. Hooks into the existing
+handle_publish via wrapping so we don't have to modify robot_client.py.
+"""
+
+import asyncio
+import logging
+import math
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import Optional, Dict, Any
+
+from robot_client import RobotClient, RobotTeleopController
+
+logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# Protocol Constants — change if your professor confirms different values
+# ----------------------------------------------------------------------
+
+GOAL_TOPIC = "/move_base_simple/goal"
+GOAL_MSG_TYPE = "geometry_msgs/PoseStamped"
+GOAL_PUBLISHER_ID = "coordinate_goal"
+GOAL_FRAME_ID = "map"
+
+NAV_STATUS_TOPIC = "/navi_status"
+NAV_STATUS_MSG_TYPE = "actionlib_msgs/GoalStatus"
+
+
+# ----------------------------------------------------------------------
+# Data Models
+# ----------------------------------------------------------------------
+
+class NavStatus(IntEnum):
+    """Navigation status codes (actionlib_msgs/GoalStatus)."""
+    PENDING = 0
+    ACTIVE = 1
+    PREEMPTED = 2
+    SUCCESS = 3
+    ABORTED = 4
+    REJECTED = 5
+    PREEMPTING = 6
+    RECALLING = 7
+    RECALLED = 8
+    LOST = 9
+
+
+@dataclass
+class Goal:
+    """A navigation goal in the map frame."""
+    x: float             # meters
+    y: float             # meters
+    theta: float = 0.0   # radians, 0 = facing +x, counter-clockwise positive
+
+    def __str__(self) -> str:
+        return f"Goal(x={self.x:.2f}, y={self.y:.2f}, theta={math.degrees(self.theta):.1f}deg)"
+
+
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
+
+def euler_yaw_to_quaternion(yaw: float) -> Dict[str, float]:
+    """Convert yaw angle (radians) to quaternion. Yaw-only since the
+    robot moves on flat ground."""
+    half = yaw * 0.5
+    return {
+        "x": 0.0,
+        "y": 0.0,
+        "z": math.sin(half),
+        "w": math.cos(half),
+    }
+
+
+def build_pose_stamped(x: float, y: float, theta: float,
+                       frame_id: str = GOAL_FRAME_ID) -> Dict[str, Any]:
+    """Build a geometry_msgs/PoseStamped JSON message."""
+    return {
+        "header": {
+            "frame_id": frame_id,
+            "stamp": {"secs": 0, "nsecs": 0},
+            "seq": 0,
+        },
+        "pose": {
+            "position": {"x": float(x), "y": float(y), "z": 0.0},
+            "orientation": euler_yaw_to_quaternion(float(theta)),
+        },
+    }
+
+
+# ----------------------------------------------------------------------
+# Navigator
+# ----------------------------------------------------------------------
+
+class CoordinateNavigator:
+    """
+    Sends coordinate-based navigation goals.
+
+    Wraps the simple RobotClient by intercepting handle_publish so it can
+    track /navi_status without needing on_topic dispatch.
+    """
+
+    def __init__(self, client: RobotClient):
+        self.client = client
+        self._initialized = False
+        self.latest_nav_status: Optional[int] = None
+        self._status_event = asyncio.Event()
+        self._original_handle_publish = None
+
+    async def initialize(self) -> None:
+        if self._initialized:
+            return
+
+        # Wrap handle_publish so we see /navi_status messages
+        self._original_handle_publish = self.client.handle_publish
+
+        def wrapped_handle_publish(data):
+            topic = data.get("topic")
+            if topic == NAV_STATUS_TOPIC:
+                msg = data.get("msg", {})
+                status = msg.get("status")
+                if status is not None:
+                    self.latest_nav_status = status
+                    self._status_event.set()
+            self._original_handle_publish(data)
+
+        self.client.handle_publish = wrapped_handle_publish
+
+        await self.client.advertise(GOAL_TOPIC, GOAL_MSG_TYPE, GOAL_PUBLISHER_ID)
+        await self.client.subscribe(NAV_STATUS_TOPIC, NAV_STATUS_MSG_TYPE,
+                                    "nav_status_sub")
+
+        self._initialized = True
+        logger.info("CoordinateNavigator initialized")
+
+    async def send_goal(self, goal: Goal) -> None:
+        """Fire-and-forget: send a goal and return immediately."""
+        if not self._initialized:
+            raise RuntimeError("Call initialize() first")
+        msg = build_pose_stamped(goal.x, goal.y, goal.theta)
+        logger.info("Sending goal: %s", goal)
+        await self.client.publish(GOAL_TOPIC, msg, GOAL_PUBLISHER_ID)
+
+    async def send_goal_and_wait(self, goal: Goal, timeout: float = 120.0) -> bool:
+        """Send a goal and wait until terminal state. Returns True on success."""
+        self.latest_nav_status = None
+        self._status_event.clear()
+
+        await self.send_goal(goal)
+
+        try:
+            await asyncio.wait_for(self._wait_for_terminal(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Goal %s timed out after %.1fs - cancelling", goal, timeout)
+            await self.cancel()
+            return False
+
+        if self.latest_nav_status == NavStatus.SUCCESS:
+            logger.info("Goal reached: %s", goal)
+            return True
+        logger.warning("Goal %s ended with status %s", goal, self.latest_nav_status)
+        return False
+
+    async def _wait_for_terminal(self) -> None:
+        terminal = {NavStatus.PREEMPTED, NavStatus.SUCCESS, NavStatus.ABORTED,
+                    NavStatus.REJECTED, NavStatus.RECALLED, NavStatus.LOST}
+        while self.latest_nav_status not in terminal:
+            self._status_event.clear()
+            await self._status_event.wait()
+
+    async def cancel(self) -> None:
+        await self.client.cancel_navigation()
+
+
+# ----------------------------------------------------------------------
+# Combined test: teleop + coordinate goal
+# ----------------------------------------------------------------------
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+
+    ROBOT_URI = "ws://10.42.0.1:9090"
+
+    client = RobotClient(ROBOT_URI)
+    await client.connect()
+    await client.initialize()
+
+    teleop = RobotTeleopController(client)
+    await teleop.initialize()
+
+    navigator = CoordinateNavigator(client)
+    await navigator.initialize()
+
+    # ---- Test 1: short teleop sanity check ----
+    print("\n=== TEST 1: Teleop forward 1s, then stop ===")
+    await teleop.set_velocity(0.1, 0.0)
+    await asyncio.sleep(1.0)
+    await teleop.set_velocity(0.0, 0.0)
+    await asyncio.sleep(1.0)
+
+    # ---- Test 2: send a coordinate goal and wait for completion ----
+    print("\n=== TEST 2: Send a coordinate goal and wait for completion ===")
+    print("Sending the robot toward (-1.38, 3.26, theta=0.93) in the map frame.")
+    success = await navigator.send_goal_and_wait(
+        Goal(x=-1.38, y=3.26, theta=0.93),
+        timeout=120.0,
+    )
+    print(f"Goal {'reached' if success else 'failed/cancelled'}")
+
+    # ---- Test 3: send the robot back to the origin ----
+    print("\n=== TEST 3: Return to origin (0, 0) ===")
+    success = await navigator.send_goal_and_wait(
+        Goal(x=0.0, y=0.0, theta=0.0),
+        timeout=120.0,
+    )
+    print(f"Return {'reached' if success else 'failed/cancelled'}")
+
+    print("\n=== Done. Latest nav_status seen:", navigator.latest_nav_status, "===")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

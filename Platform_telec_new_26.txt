@@ -1,0 +1,146 @@
+import asyncio
+import websockets
+import json
+
+class RobotClient:
+    """Core client for handling WebSocket communication with the robot."""
+    def __init__(self, uri):
+        self.uri = uri
+        self.ws = None
+        self.fragment_buffer = {}
+        self._listen_task = None
+
+    async def connect(self):
+        self.ws = await websockets.connect(self.uri)
+        print(f"[System] Connected to {self.uri}")
+        self._listen_task = asyncio.create_task(self.listen())
+
+    async def listen(self):
+        try:
+            async for message in self.ws:
+                data = json.loads(message)
+                op = data.get("op")
+                if op == "publish":
+                    self.handle_publish(data)
+                elif op == "fragment":
+                    self.handle_fragment(data)
+                elif op == "service_response":
+                    self.handle_service_response(data)
+                else:
+                    print(f"[Unknown] {data}")
+        except websockets.exceptions.ConnectionClosed:
+            print("[System] Connection closed.")
+
+    def handle_publish(self, data):
+        topic = data.get("topic")
+        print(f"[Publish] Topic: {topic} | Data: {data}")
+
+    def handle_fragment(self, data):
+        packet_id = data.get("id")
+        num = data.get("num")
+        total = data.get("total")
+        frag_data = data.get("data")
+
+        if packet_id not in self.fragment_buffer:
+            self.fragment_buffer[packet_id] = [None] * total
+
+        self.fragment_buffer[packet_id][num] = frag_data
+
+        if None not in self.fragment_buffer[packet_id]:
+            print(f"[System] Fragments Reassembled for ID: {packet_id}")
+            full_string = "".join(self.fragment_buffer[packet_id])
+            full_data = json.loads(full_string)
+            self.handle_publish(full_data)
+            del self.fragment_buffer[packet_id]
+
+    def handle_service_response(self, data):
+        service = data.get("service")
+        result = data.get("result")
+        values = data.get("values", {})
+
+        if service == "/poi":
+            if values.get("success"):
+                print("[Navigation] Successfully routing to POI.")
+            else:
+                available = values.get("available_list", [])
+                print(f"[Navigation Error] Available POIs: {available}")
+        else:
+            print(f"[Service Response] {service} -> Result: {result}, Info: {values}")
+
+    async def subscribe(self, topic, msg_type, id_str):
+        payload = {"op": "subscribe", "id": id_str, "topic": topic, "type": msg_type}
+        await self.ws.send(json.dumps(payload))
+
+    async def advertise(self, topic, msg_type, id_str):
+        payload = {"op": "advertise", "id": id_str, "topic": topic, "type": msg_type}
+        await self.ws.send(json.dumps(payload))
+
+    async def publish(self, topic, msg, id_str=""):
+        payload = {"op": "publish", "topic": topic, "msg": msg}
+        if id_str:
+            payload["id"] = id_str
+        await self.ws.send(json.dumps(payload))
+
+    async def call_service(self, service, args, id_str):
+        payload = {"op": "call_service", "id": id_str, "service": service, "args": args}
+        await self.ws.send(json.dumps(payload))
+
+    async def initialize(self):
+        await self.advertise("/move_base/cancel", "actionlib_msgs/GoalID", "cancel_goal")
+
+    async def navigate_to_poi(self, target_name):
+        args = {"poi": target_name}
+        await self.call_service("/poi", args, "service_poi_navigation")
+
+    async def cancel_navigation(self):
+        cancel_msg = {"stamp": "", "id": ""}
+        await self.publish("/move_base/cancel", cancel_msg, "cancel_goal")
+
+
+class RobotTeleopController:
+    """Manages teleoperation safely according to strict protocol rules."""
+    def __init__(self, websocket_client):
+        self.client = websocket_client
+        self.topic = "/cmd_vel_mux/input/teleop"
+        self.id_str = "velocity_control"
+        self.current_linear = 0.0
+        self.current_angular = 0.0
+        self.is_moving = False
+        self.keep_alive_task = None
+
+    async def initialize(self):
+        await self.client.advertise(self.topic, "geometry_msgs/Twist", self.id_str)
+
+    async def set_velocity(self, linear_x, angular_z):
+        self.current_linear = linear_x
+        self.current_angular = angular_z
+
+        if linear_x == 0.0 and angular_z == 0.0:
+            await self._stop_robot()
+        else:
+            await self._send_command(linear_x, angular_z)
+            if not self.is_moving:
+                self.is_moving = True
+                self.keep_alive_task = asyncio.create_task(self._publish_loop())
+
+    async def _publish_loop(self):
+        while self.is_moving:
+            await self._send_command(self.current_linear, self.current_angular)
+            await asyncio.sleep(0.4)
+
+    async def _stop_robot(self):
+        if not self.is_moving:
+            return
+        self.is_moving = False
+        if self.keep_alive_task:
+            self.keep_alive_task.cancel()
+            try:
+                await self.keep_alive_task
+            except asyncio.CancelledError:
+                pass
+            self.keep_alive_task = None
+        await self._send_command(0.0, 0.0)
+
+    async def _send_command(self, x, z):
+        msg = {"linear": {"x": x}, "angular": {"z": z}}
+        await self.client.publish(self.topic, msg, self.id_str)

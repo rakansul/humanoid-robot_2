@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+import sys, time
+import tty, termios, select
+from pypot.robot import from_json
+import rclpy, time
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+import  math
+from control_msgs.msg import JointTrajectoryControllerState
+CONFIG_PATH = "/home/pi/Desktop/Ubaid motors/Ubaid driver.json"
+STEP_DEG = 5.0
+
+# All zeros — within range for every motor. Edit per joint as you settle on a real safe pose.
+SAFE_POSE = {
+    "l_shoulder_pitch": 0.0, "l_shoulder_roll": -80.0, "l_shoulder_yaw": 0.0,
+    "l_elbow": 0.0, "l_wrist": 0.0, "l_gripper": 0.0,
+    "r_shoulder_pitch": 0.0, "r_shoulder_roll": 0.0, "r_shoulder_yaw": 0.0,
+    "r_elbow": 0.0, "r_wrist": 0.0, "r_gripper": 0.0,
+    "neck_y": 0.0, "neck_z": 0.0,
+}
+
+GEAR_RATIOS = {
+    11: 60.0 / 27.0, 21: 60.0 / 27.0,
+    12: 50.0 / 25.0, 13: 50.0 / 25.0, 15: 50.0 / 25.0,
+    22: 50.0 / 25.0, 23: 50.0 / 25.0, 25: 50.0 / 25.0,
+    14: 4.0 / 1.0, 24: 4.0 / 1.0,
+    16: 1.0, 26: 1.0, 31: 1.0, 32: 1.0,
+}
+class Abeed(Node):
+    def __init__(self):
+        super().__init__("Robot_Driver")
+
+        # Robot State Publisher
+        self.rsp = self.create_publisher(
+            JointState, "/joint_states", 10
+        )
+
+        self.robot = from_json(CONFIG_PATH)
+        time.sleep(0.2)
+
+        for m in self.robot.motors:
+            m.compliant = True
+        time.sleep(0.3)
+
+        timer_period = 0.01
+        self.timer = self.create_timer(timer_period, self.publish_states)
+        self.right_sub = self.create_subscription( # creat sub
+            JointTrajectoryControllerState,
+            '/Right_arm_controller/controller_state',
+            self.right_arm_callback,
+            10)
+
+        self.left_sub = self.create_subscription(
+            JointTrajectoryControllerState,
+            '/left_arm_controller/controller_state',
+            self.left_arm_callback,
+            10)
+
+    def right_arm_callback(self, msg):
+        self.execute_state_command("right_arm", msg)
+
+    def left_arm_callback(self, msg):
+        self.execute_state_command("left_arm", msg)
+
+    def execute_state_command(self, group_name, msg):
+        # Extract the target positions MoveIt wants the arm to be at right now
+        target_radians = msg.reference.positions
+        joint_names = msg.joint_names
+
+        # Convert MoveIt's radians into a dictionary of degrees for your driver
+        command_dict = {}
+        for name, rad in zip(joint_names, target_radians):
+            command_dict[name] = math.degrees(rad)
+
+        # Send the calculated degrees straight to the physical motors
+        self.give_command(group_name, command_dict)
+    def apply_gear_ratio(self, angle, motor):
+        return angle * GEAR_RATIOS.get(motor.id, 1.0)
+
+    def reverse_gear_ratio(self, angle, motor):
+        ratio = GEAR_RATIOS.get(motor.id, 1.0)
+        return angle / ratio if ratio else angle
+
+    def get_pos(self, group_name):
+        group = getattr(self.robot, group_name)
+        return {m.name: self.reverse_gear_ratio(m.present_position, m) for m in group}
+
+    def give_command(self, group_name, joint_positions):
+        group = getattr(self.robot, group_name)
+        for m in group:
+            if m.name in joint_positions:
+                m.compliant = False
+                print(self.apply_gear_ratio(joint_positions[m.name], m))
+                m.goal_position = self.apply_gear_ratio(joint_positions[m.name], m)
+
+    def kill_all_torque(self, delay=1.0):
+        time.sleep(delay)
+        for m in self.robot.motors:
+            m.compliant = True
+            m.torque_limit = 0
+        time.sleep(0.3)
+
+    def publish_states(self):
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        for m in self.robot.motors:
+            try:
+                msg.name.append(m.name)
+                # reverse_gear_ratio gets the actual joint angle in degrees
+                pos_deg = self.reverse_gear_ratio(m.present_position, m)
+                msg.position.append(math.radians(float(pos_deg)))
+            except Exception as e:
+                self.get_logger().error("failed to read")
+                pass
+        self.rsp.publish(msg)
+        print(msg)
+def main():
+    rclpy.init()
+    node = Abeed()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+    # while 1:
+    #     for m in robot.robot.left_arm:
+    #             try:
+    #                 pos = m.present_position
+    #                 joint_angle = robot.reverse_gear_ratio(pos, m)
+    #                 print(f"  ✓ id={m.id:3d}  {m.name:20s}  pos={pos:7.2f}° joint_angle={joint_angle:7.2f}°")
+    #
+    #             except Exception as e:
+    #                 print(f"  ✗ id={m.id:3d}  {m.name:20s}  ERROR: {e}")
+    #     print("\n\n")
+    #     time.sleep(0.5)
+
+    # robot.give_command("left_arm", {"l_shoulder_pitch": 30, "l_shoulder_roll": 10, "l_shoulder_yaw": 60, "l_elbow": 70, "l_wrist": 70, "l_gripper": 0 })
+    #
+    # robot.kill_all_torque(delay=1.5)
+    # robot.robot.close()
+
+if __name__ == "__main__":
+    main()
+
+    #for m in robot.robot.left_arm:
+    #     joint_angle = robot.reverse_gear_ratio(pos, m)
