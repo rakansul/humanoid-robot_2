@@ -148,3 +148,8 @@ if __name__ == "__main__":
 
     #for m in robot.robot.left_arm:
     #     joint_angle = robot.reverse_gear_ratio(pos, m)
+
+
+
+    #Update the new Jeson file so it the update is in ids: 11,12,21,22 
+    #the update is in motor name type to MX-64
